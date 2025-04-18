@@ -1,4 +1,5 @@
 ﻿using System.Runtime.InteropServices;
+using System.Text;
 
 namespace TextInputDeviceIdentifier
 {
@@ -153,6 +154,13 @@ namespace TextInputDeviceIdentifier
             RegisterRawInputDevices(rid, (uint)rid.Length, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE)));
         }
 
+        [DllImport("user32.dll")]
+        private static extern IntPtr DefWindowProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint GetRawInputDeviceInfo(IntPtr hDevice, uint uiCommand, IntPtr pData, ref uint pcbSize);
+
         private static IntPtr CustomWndProc(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam)
         {
             if (message == WM_INPUT)
@@ -169,13 +177,16 @@ namespace TextInputDeviceIdentifier
                         if (raw.header.dwType == RIM_TYPEKEYBOARD)
                         {
                             string deviceName = GetDeviceName(raw.header.hDevice);
-                            //string serial = TryGetSerialNumber(deviceName);
                             if (deviceName.Contains("HID#VID_E851&PID_2100")) // Filter input by specific device  
                             {
                                 if ((raw.keyboard.Flags & 0x01) == 0) // Key down event  
                                 {
-                                    char inputChar = (char)raw.keyboard.VKey;
-                                    OnDeviceInput(deviceName, inputChar);
+                                    // Convert virtual key to correct character using Windows API
+                                    char? inputChar = VirtualKeyToChar(raw.keyboard.VKey, raw.keyboard.MakeCode, raw.keyboard.Flags);
+                                    if (inputChar.HasValue)
+                                    {
+                                        OnDeviceInput(deviceName, inputChar.Value);
+                                    }
                                 }
                             }
                         }
@@ -189,8 +200,7 @@ namespace TextInputDeviceIdentifier
             return DefWindowProc(hWnd, message, wParam, lParam);
         }
 
-        [DllImport("user32.dll")]
-        private static extern IntPtr DefWindowProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+        // Fix for CS8603: Possible null reference return.
         private static string GetDeviceName(IntPtr hDevice)
         {
             uint size = 0;
@@ -201,7 +211,7 @@ namespace TextInputDeviceIdentifier
             {
                 if (GetRawInputDeviceInfo(hDevice, 0x20000007, pData, ref size) > 0)
                 {
-                    return Marshal.PtrToStringAnsi(pData);
+                    return Marshal.PtrToStringAnsi(pData) ?? string.Empty;
                 }
                 return string.Empty;
             }
@@ -211,13 +221,53 @@ namespace TextInputDeviceIdentifier
             }
         }
 
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern uint GetRawInputDeviceInfo(IntPtr hDevice, uint uiCommand, IntPtr pData, ref uint pcbSize);
+        // Add these new methods and P/Invoke declarations to handle character conversion
+        [DllImport("user32.dll")]
+        private static extern int ToUnicode(
+            uint wVirtKey,
+            uint wScanCode,
+            byte[] lpKeyState,
+            [Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pwszBuff,
+            int cchBuff,
+            uint wFlags);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetKeyboardState(byte[] lpKeyState);
+
+        private static char? VirtualKeyToChar(ushort virtualKey, ushort scanCode, ushort flags)
+        {
+            // Get the keyboard state
+            byte[] keyboardState = new byte[256];
+            GetKeyboardState(keyboardState);
+
+            // Convert to Unicode
+            StringBuilder result = new StringBuilder(5);
+            int resultLength = ToUnicode(
+                virtualKey,
+                scanCode,
+                keyboardState,
+                result,
+                result.Capacity,
+                0);
+
+            // Return the first character if conversion succeeds
+            if (resultLength > 0)
+            {
+                return result[0];
+            }
+
+            // Fall back to basic conversion for special keys like Enter
+            if (virtualKey == 0x0D) return '\r'; // Enter key
+            if (virtualKey == 0x08) return '\b'; // Backspace
+
+            return null;
+        }
 
         private static void OnDeviceInput(string deviceId, char inputChar)
         {
             if (!deviceInputs.ContainsKey(deviceId))
                 deviceInputs[deviceId] = new ScannedInput(deviceId);
+
             if (inputChar == '\r' || inputChar == '\n') // Enter key
             {
                 var scanned = deviceInputs[deviceId];
@@ -227,37 +277,16 @@ namespace TextInputDeviceIdentifier
                     scanned.Input = string.Empty;
                 }
             }
+            else if (inputChar == '\b') // Handle backspace
+            {
+                if (deviceInputs[deviceId].Input.Length > 0)
+                    deviceInputs[deviceId].Input = deviceInputs[deviceId].Input.Substring(0, deviceInputs[deviceId].Input.Length - 1);
+            }
             else
             {
                 deviceInputs[deviceId].Input += inputChar;
             }
         }
 
-        // Fix for IDE0063: Simplify the 'using' statement
-        // private static string TryGetSerialNumber(string devicePath)
-        // {
-        //     using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_PnPEntity");
-        //     foreach (var device in searcher.Get())
-        //     {
-        //         string deviceId = device["DeviceID"]?.ToString() ?? "";
-        //         if (deviceId.Contains("VID_E851&PID_2100") && deviceId.Contains("HID"))
-        //         {
-        //             string pnpDeviceId = device["PNPDeviceID"]?.ToString() ?? "";
-        //             string description = device["Description"]?.ToString() ?? "";
-        //             string name = device["Name"]?.ToString() ?? "";
-        //             string serial = ExtractSerialFromDeviceId(pnpDeviceId);
-        //             return $"{serial}"; // or add other info here
-        //         }
-        //     }
-        //     return null;
-        // }
-
-
-        // private static string ExtractSerialFromDeviceId(string pnpDeviceId)
-        // {
-        //     // PNPDeviceID format: HID\VID_E851&PID_2100\xxxxxxxxxxxxxxxx
-        //     var parts = pnpDeviceId.Split('\\');
-        //     return parts.Length >= 3 ? parts[2] : null;
-        // }
     }
 }
